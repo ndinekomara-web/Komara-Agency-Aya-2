@@ -1,90 +1,120 @@
 """
-Logging vers Google Sheets.
-Tous les appels sont ASYNCHRONES pour ne pas bloquer le bot.
+Journalisation des conversations vers Google Sheets — entièrement facultative.
+
+Si les bibliothèques Google ou les identifiants ne sont pas fournis,
+l'application continue de fonctionner normalement : les échanges sont alors
+seulement conservés dans la base locale (``chat_store``).
 """
+from __future__ import annotations
+
 import json
 import logging
 import threading
 import time
-import gspread
+
+from config import (
+    GOOGLE_CREDENTIALS_JSON,
+    GOOGLE_CREDENTIALS_PATH,
+    GOOGLE_SHEETS_ID,
+)
 
 logger = logging.getLogger("komara.sheets")
-from oauth2client.service_account import ServiceAccountCredentials
-from config import GOOGLE_SHEETS_ID, GOOGLE_CREDENTIALS_JSON, GOOGLE_CREDENTIALS_PATH
 
-# === Client Google Sheets ===
 _gc = None
 _sheet = None
 _lock = threading.Lock()
+_disabled_reason: str | None = None
+
+
+def available() -> bool:
+    """Indique si le journal Sheets peut être utilisé."""
+    if _disabled_reason:
+        return False
+    if not GOOGLE_SHEETS_ID:
+        return False
+    try:
+        import gspread  # noqa: F401
+        import oauth2client  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def _load_credentials(scope):
-    """Charge les identifiants : variable d'env en priorité (jamais
-    dans le repo), sinon fichier credentials.json local."""
+    from oauth2client.service_account import ServiceAccountCredentials
+
     if GOOGLE_CREDENTIALS_JSON.strip():
-        data = json.loads(GOOGLE_CREDENTIALS_JSON)
-        return ServiceAccountCredentials.from_json_keyfile_dict(data, scope)
+        return ServiceAccountCredentials.from_json_keyfile_dict(
+            json.loads(GOOGLE_CREDENTIALS_JSON), scope
+        )
     return ServiceAccountCredentials.from_json_keyfile_name(
         GOOGLE_CREDENTIALS_PATH, scope
     )
 
 
 def _get_sheet():
-    """Initialise le client Google Sheets (lazy loading)."""
-    global _gc, _sheet
+    global _gc, _sheet, _disabled_reason
     if _sheet is None:
+        if not available():
+            _disabled_reason = _disabled_reason or "Google Sheets non configuré"
+            return None
         with _lock:
             if _sheet is None:
-                scope = [
-                    "https://spreadsheets.google.com/feeds",
-                    "https://www.googleapis.com/auth/drive",
-                ]
-                creds = _load_credentials(scope)
-                _gc = gspread.authorize(creds)
-                _sheet = _gc.open_by_key(GOOGLE_SHEETS_ID).sheet1
+                try:
+                    import gspread
+
+                    scope = [
+                        "https://spreadsheets.google.com/feeds",
+                        "https://www.googleapis.com/auth/drive",
+                    ]
+                    _gc = gspread.authorize(_load_credentials(scope))
+                    _sheet = _gc.open_by_key(GOOGLE_SHEETS_ID).sheet1
+                except Exception as exc:  # pragma: no cover - dépend du réseau
+                    _disabled_reason = str(exc)
+                    logger.warning("Google Sheets indisponible : %s", exc)
+                    return None
     return _sheet
 
 
-def _write_to_sheet(chat_id: str, user_name: str, role: str, message: str, lang: str):
-    """Écrit une ligne dans Google Sheets (appelé dans un thread séparé)."""
+def _write_to_sheet(session_id, user_name, role, message, lang):
     try:
         sheet = _get_sheet()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([timestamp, str(chat_id), user_name, role, message, lang])
-    except Exception as e:
-        # Boss 12/10 : erreur VISIBLE dans les logs Railway (fini le print muet)
-        logger.error("[Sheets] Écriture impossible : %s", e)
+        if sheet is None:
+            return
+        sheet.append_row(
+            [time.strftime("%Y-%m-%d %H:%M:%S"), str(session_id), user_name, role, message, lang]
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Écriture Sheets impossible : %s", exc)
 
 
-def log_conversation(chat_id: str, user_name: str, role: str, message: str, lang: str = "fr"):
-    """
-    Log une conversation vers Google Sheets de manière ASYNCHRONE.
-    Ne bloque jamais le thread principal.
-    """
-    thread = threading.Thread(
+def log_conversation(session_id, user_name, role, message, lang="fr"):
+    """Enregistre un échange sans bloquer la réponse."""
+    if not available():
+        return
+    threading.Thread(
         target=_write_to_sheet,
-        args=(chat_id, user_name, role, message, lang),
+        args=(session_id, user_name, role, message, lang),
         daemon=True,
-    )
-    thread.start()
+    ).start()
 
 
-def get_last_messages(chat_id: str, n: int = 5) -> list[dict]:
-    """Récupère les N derniers messages d'un chat (synchrone, pour le contexte RAG)."""
+def get_last_messages(session_id, n: int = 5) -> list[dict]:
     try:
         sheet = _get_sheet()
-        all_records = sheet.get_all_records()
-        chat_records = [r for r in all_records if str(r.get("chat_id", "")) == str(chat_id)]
-        return chat_records[-n:]
-    except Exception as e:
-        logger.error("[Sheets] Lecture impossible : %s", e)
+        if sheet is None:
+            return []
+        records = sheet.get_all_records()
+        rows = [r for r in records if str(r.get("chat_id", "")) == str(session_id)]
+        return rows[-n:]
+    except Exception:
         return []
 
 
 def diagnose() -> str:
-    """Boss 12/10 : état de la connexion Sheets en une ligne."""
-    try:
-        sheet = _get_sheet()
-        return f"Sheets OK (onglet '{sheet.title}', {len(sheet.row_values(1))} colonnes)"
-    except Exception as e:
-        return f"Sheets ERREUR : {e}"
+    if not GOOGLE_SHEETS_ID:
+        return "Sheets non configuré (journal local uniquement)"
+    sheet = _get_sheet()
+    if sheet is None:
+        return f"Sheets ERREUR : {_disabled_reason}"
+    return f"Sheets OK (onglet '{sheet.title}')"

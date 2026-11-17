@@ -1,0 +1,3 @@
+# Optionnel : journalisation des conversations vers Google Sheets.
+gspread==6.1.4
+oauth2client==4.1.3
